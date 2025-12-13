@@ -27,6 +27,7 @@ import random
 import logging
 import platform
 from pathlib import Path
+from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, Filters
@@ -34,6 +35,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryH
 # -----------------------------
 # Paths / config
 # -----------------------------
+load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
