@@ -2,90 +2,112 @@
 # -*- coding: utf-8 -*-
 
 """
-AiAntiblokBot — MVP (clean)
+AiAntiblokBot — тематический Telegram-бот (Python 3.6+, python-telegram-bot==12.8)
 
-Функции:
-- Доступ к материалам только подписчикам канала https://t.me/Borodulin_expert
-- Меню: Раздатка / Шаблон / Курс
-- Раздатка и Шаблон берутся из kb/content.json (генерится kb/rebuild_content.py)
-- По клику на пункт — отправка файла
-- /status — диагностика (можно ограничить ADMIN_IDS)
-- Текстовые вопросы:
-  - по теме (115-ФЗ/блокировки/комплаенс) — памятка + позже KB+GigaChat
-  - не по теме — вежливый отбой
-  - мат/агрессия — юморные ответы (рандом)
+MVP функции:
+1) Доступ к материалам только подписчикам канала https://t.me/Borodulin_expert
+2) Меню: Раздатка / Шаблон / Курс
+   - Раздатка: список файлов из kb/handouts (через kb/content.json)
+   - Шаблон: список файлов из kb/templates (через kb/content.json)
+   - Курс: список ссылок
+   - По нажатию на пункт списка — отправка файла
+3) Вопросы по теме блокировок/115-ФЗ:
+   - ищем релевантные фрагменты в базе знаний kb/text (индекс kb/text_index.json)
+   - формируем ответ через GigaChat API (с учётом контекста из базы)
+4) Вопросы не по теме: вежливый отбой (“консультирую только по блокировкам…”)
+5) Мат/агрессия: юморные ответы (рандом)
+6) /status — диагностика
 
-Совместимо с python-telegram-bot (Updater/Dispatcher, Filters).
-Python 3.6+
+Важно:
+- Токены/ключи храним только в .env (в корне проекта рядом с bot.py)
+- Для SSL к GigaChat обычно нужен CA bundle. По умолчанию: data/ca/ca_bundle.pem
 """
 
 import os
 import re
 import json
 import time
+import math
 import random
 import logging
 import platform
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, Filters
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    Filters,
+)
+
+from gigachat_client import GigaChatClient
+
 
 # -----------------------------
-# Paths / config
+# Paths / env
 # -----------------------------
-load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
 KB_DIR = BASE_DIR / "kb"
 
+# Load .env first!
+load_dotenv(str(BASE_DIR / ".env"))
+
 CONTENT_JSON = KB_DIR / "content.json"
+TEXT_INDEX_JSON = KB_DIR / "text_index.json"
 HEARTBEAT_FILE = DATA_DIR / "heartbeat.txt"
 
-def read_token():
-    t = (os.getenv("BOT_TOKEN", "") or "").strip()
-    if t:
-        return t
-    token_file = DATA_DIR / "token.txt"
-    if token_file.exists():
-        try:
-            t2 = token_file.read_text(encoding="utf-8").strip()
-            return t2
-        except Exception:
-            return ""
-    return ""
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-BOT_TOKEN = read_token()
-REQUIRED_CHANNEL = (os.getenv("REQUIRED_CHANNEL", "@Borodulin_expert") or "").strip()
-PAID_MODE = (os.getenv("PAID_MODE", "0") or "").strip() in ("1", "true", "True", "YES", "yes")
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@Borodulin_expert").strip()  # @channelusername
 
+# if you want feature flags later
+PAID_MODE = os.getenv("PAID_MODE", "0").strip().lower() in ("1", "true", "yes")
+
+# /status can be limited to admins (comma-separated user ids)
 ADMIN_IDS = set()
-_admin_raw = (os.getenv("ADMIN_IDS", "") or "").strip()
+_admin_raw = os.getenv("ADMIN_IDS", "").strip()
 if _admin_raw:
     try:
         ADMIN_IDS = set(int(x.strip()) for x in _admin_raw.split(",") if x.strip())
     except Exception:
         ADMIN_IDS = set()
 
+# GigaChat config
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "").strip()  # WITHOUT "Basic "
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
+GIGACHAT_CA_BUNDLE = os.getenv("GIGACHAT_CA_BUNDLE", str(DATA_DIR / "ca" / "ca_bundle.pem")).strip()
+GIGACHAT_VERIFY = os.getenv("GIGACHAT_VERIFY", "1").strip() not in ("0", "false", "False", "no", "NO")
+
 START_TS = int(time.time())
 
 # membership cache
-_SUB_CACHE = {}          # user_id -> (ts, bool)
-SUB_CACHE_TTL = 60       # seconds
+_SUB_CACHE = {}  # user_id -> (ts, bool)
+SUB_CACHE_TTL = 60  # sec
 
-# pagination
-PAGE_SIZE = 20
+# text index cache
+_TEXT_INDEX = None
+_TEXT_INDEX_MTIME = 0
+
 
 # -----------------------------
-# Logging / heartbeat
+# Logging
 # -----------------------------
 def init_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / "bot.log"
 
-    log_path = LOG_DIR / "bot.log"   # чтобы совпадало с твоим watchdog/tail
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s AiAntiblokBot: %(message)s",
@@ -96,6 +118,7 @@ def init_logging():
     )
     logging.info("Logging initialized. pid=%s base=%s", os.getpid(), str(BASE_DIR))
 
+
 def touch_heartbeat():
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -103,12 +126,14 @@ def touch_heartbeat():
     except Exception:
         pass
 
+
 def heartbeat_age():
     try:
         ts = int(HEARTBEAT_FILE.read_text(encoding="utf-8").strip())
         return int(time.time()) - ts
     except Exception:
         return None
+
 
 def fmt_uptime(seconds):
     if seconds < 60:
@@ -121,10 +146,18 @@ def fmt_uptime(seconds):
     m2 = m % 60
     return "%sh %sm" % (h, m2)
 
+
 # -----------------------------
 # Content loading
 # -----------------------------
 def load_content():
+    """
+    content.json:
+    {
+      "handouts": [{"id":"...", "title":"...", "relpath":"kb/handouts/file.pdf", ...}],
+      "templates": [{"id":"...", "title":"...", "relpath":"kb/templates/file.docx", ...}]
+    }
+    """
     try:
         raw = CONTENT_JSON.read_text(encoding="utf-8")
         obj = json.loads(raw)
@@ -135,6 +168,7 @@ def load_content():
         return obj
     except Exception:
         return {"handouts": [], "templates": []}
+
 
 def safe_resolve_relpath(relpath):
     """
@@ -149,6 +183,7 @@ def safe_resolve_relpath(relpath):
     except Exception:
         pass
     return None
+
 
 # -----------------------------
 # Subscription gate
@@ -170,7 +205,19 @@ def is_subscriber(bot, user_id):
     _SUB_CACHE[user_id] = (now, ok)
     return ok
 
-def send_subscribe_prompt(chat, bot=None):
+
+def gate_or_prompt(update, context):
+    """
+    True => доступ разрешён
+    False => отправлено сообщение “подпишитесь”
+    """
+    uid = update.effective_user.id if update.effective_user else None
+    if not uid:
+        return False
+
+    if is_subscriber(context.bot, uid):
+        return True
+
     text = (
         "Доступ к материалам — только для подписчиков канала:\n"
         "✅ https://t.me/Borodulin_expert\n\n"
@@ -180,16 +227,9 @@ def send_subscribe_prompt(chat, bot=None):
         [InlineKeyboardButton("Подписаться", url="https://t.me/Borodulin_expert")],
         [InlineKeyboardButton("Проверить подписку", callback_data="CHECK_SUB")],
     ])
-    chat.reply_text(text, reply_markup=kb)
-
-def gate_or_prompt(update, context):
-    uid = update.effective_user.id if update.effective_user else None
-    if not uid:
-        return False
-    if is_subscriber(context.bot, uid):
-        return True
-    send_subscribe_prompt(update.message, context.bot)
+    update.message.reply_text(text, reply_markup=kb)
     return False
+
 
 # -----------------------------
 # Humor / moderation
@@ -201,106 +241,235 @@ HUMOR_VARIANTS = [
     "Мама говорила: ярлыки — для коробок. Я — для ответов.",
     "Мама говорила: ИИ — это как коробка конфет. Никогда не знаешь, что спросишь следующим.",
 ]
-
 _BAD_WORDS = ["сука", "бляд", "хуй", "хуе", "пизд", "еба", "ёба", "нахуй", "мудак", "говно", "идиот"]
+
+
 def is_abusive(text):
     t = (text or "").lower()
     return any(w in t for w in _BAD_WORDS)
 
+
 # -----------------------------
-# Topic routing (MVP эвристика)
+# Topic routing
 # -----------------------------
 TOPIC_KEYWORDS = [
-    "блок", "замороз", "115", "комплаенс", "росфин", "счет", "счёт", "карта", "перевод",
-    "платеж", "платёж", "дбо", "банк", "огранич", "разблок",
+    "блок", "замороз", "115", "комплаенс", "росфин", "росфинмониторинг",
+    "счет", "счёт", "карта", "перевод", "платеж", "платёж",
+    "дбо", "банк", "огранич", "разблок", "попал в базу", "мошенническ",
 ]
+
 
 def is_on_topic(text):
     t = (text or "").lower()
     return any(k in t for k in TOPIC_KEYWORDS)
 
-def answer_on_topic(update, context):
-    msg = (
-        "✅ Опишите ситуацию 2–3 фразами: что заблокировали, какая операция, кто контрагент, что ответил банк.\n"
-        "✅ Я подскажу план действий и, если нужно, предложу раздаточные материалы.\n\n"
-        "✅ Если хотите системно — курс «Как вести бизнес, чтобы не заблокировали счета в банке». Напишите: «Хочу курс»."
-    )
-    update.message.reply_text(msg)
 
 def answer_off_topic(update, context):
     update.message.reply_text(
-        "Я отвечаю по теме блокировок счетов/карт, 115-ФЗ и финансовой безопасности.\n"
-        "Если вопрос другой — уточните, как он связан с блокировкой/комплаенсом."
+        "Я ИИ‑помощник и консультирую только по вопросам блокировок счетов/карт, 115‑ФЗ и комплаенса.\n"
+        "Переформулируйте вопрос так, чтобы была связь с блокировкой."
     )
+
+
+# -----------------------------
+# KB text index (retrieval)
+# -----------------------------
+_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
+
+
+def _tokenize(s):
+    return [w.lower() for w in _WORD_RE.findall(s or "") if len(w) >= 2]
+
+
+def load_text_index():
+    global _TEXT_INDEX, _TEXT_INDEX_MTIME
+    if not TEXT_INDEX_JSON.exists():
+        _TEXT_INDEX = None
+        _TEXT_INDEX_MTIME = 0
+        return None
+
+    mtime = int(TEXT_INDEX_JSON.stat().st_mtime)
+    if _TEXT_INDEX and _TEXT_INDEX_MTIME == mtime:
+        return _TEXT_INDEX
+
+    try:
+        obj = json.loads(TEXT_INDEX_JSON.read_text(encoding="utf-8"))
+        if isinstance(obj, dict) and "chunks" in obj and "postings" in obj:
+            _TEXT_INDEX = obj
+            _TEXT_INDEX_MTIME = mtime
+            return obj
+    except Exception:
+        pass
+
+    _TEXT_INDEX = None
+    _TEXT_INDEX_MTIME = mtime
+    return None
+
+
+def search_kb(query, top_k=3):
+    """
+    Simple TF-IDF scoring over chunk postings from kb/rebuild_text_index.py output.
+    Returns list of chunks (dict) with fields: text, source, idx, ...
+    """
+    idx = load_text_index()
+    if not idx:
+        return []
+
+    q_terms = _tokenize(query)
+    if not q_terms:
+        return []
+
+    postings = idx.get("postings", {}) or {}
+    df = idx.get("df", {}) or {}
+    N = int(idx.get("N", 0) or 0)
+    chunks = idx.get("chunks", []) or []
+
+    scores = {}
+    for term in q_terms:
+        plist = postings.get(term)
+        if not plist:
+            continue
+        dfi = int(df.get(term, 0) or 0)
+        # idf with smoothing
+        idf = math.log((N + 1.0) / (dfi + 1.0)) + 1.0
+        for item in plist:
+            # item: [chunk_idx, tf]
+            try:
+                cidx = int(item[0])
+                tf = float(item[1])
+            except Exception:
+                continue
+            scores[cidx] = scores.get(cidx, 0.0) + tf * idf
+
+    if not scores:
+        return []
+
+    best = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    out = []
+    for cidx, sc in best:
+        if 0 <= cidx < len(chunks):
+            ch = chunks[cidx]
+            ch2 = dict(ch)
+            ch2["_score"] = sc
+            out.append(ch2)
+    return out
+
+
+# -----------------------------
+# GigaChat answering
+# -----------------------------
+def build_system_prompt():
+    return (
+        "Ты — консультант по блокировкам банковских счетов/карт, 115‑ФЗ, комплаенсу и финансовой безопасности бизнеса.\n"
+        "Отвечай по‑деловому, кратко, по шагам.\n"
+        "Если пользователь спрашивает не по теме блокировок/комплаенса — вежливо откажи и попроси переформулировать.\n"
+        "Не выдумывай факты. Если данных недостаточно — задай 2–3 уточняющих вопроса.\n"
+    )
+
+
+def build_user_prompt(user_text, kb_chunks):
+    ctx = ""
+    if kb_chunks:
+        parts = []
+        for ch in kb_chunks:
+            src = ch.get("source", "kb")
+            txt = (ch.get("text") or "").strip()
+            if not txt:
+                continue
+            # safety: limit context length
+            if len(txt) > 1200:
+                txt = txt[:1200] + "…"
+            parts.append("Источник: {}\n{}".format(src, txt))
+        if parts:
+            ctx = "Ниже выдержки из базы знаний. Используй их как основу ответа.\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+
+    return ctx + "Вопрос пользователя:\n" + user_text
+
+
+def answer_on_topic(update, context):
+    user_text = (update.message.text or "").strip()
+
+    kb_chunks = search_kb(user_text, top_k=3)
+
+    # If we have no KB at all, we can still answer via GigaChat, but keep it safe.
+    if not GIGACHAT_AUTH_KEY:
+        # fallback: no gigachat configured
+        update.message.reply_text(
+            "Сейчас ИИ‑модуль не настроен.\n"
+            "Но я могу подсказать базовый план: что именно заблокировали (счёт/карта), какая операция, кто контрагент и что ответил банк?"
+        )
+        return
+
+    try:
+        client = GigaChatClient(
+            auth_key=GIGACHAT_AUTH_KEY,
+            scope=GIGACHAT_SCOPE,
+            model=GIGACHAT_MODEL,
+            ca_bundle_path=GIGACHAT_CA_BUNDLE,
+            verify=GIGACHAT_VERIFY,
+            timeout=30,
+        )
+        resp = client.chat(
+            system_prompt=build_system_prompt(),
+            user_prompt=build_user_prompt(user_text, kb_chunks),
+            temperature=0.2,
+            max_tokens=900,
+        )
+        update.message.reply_text(resp)
+    except Exception as e:
+        logging.exception("GigaChat error: %s", e)
+        update.message.reply_text("Сейчас не могу обратиться к ИИ‑модулю. Попробуйте ещё раз позже.")
+
 
 # -----------------------------
 # UI: lists / files / courses
 # -----------------------------
-def _get_section_items(section):
+def show_list(update, section_key, prefix):
+    """
+    section_key: "handouts" | "templates"
+    prefix: "H" | "T"
+    """
     content = load_content()
-    return (content.get(section, []) or [])
-
-def _build_list_keyboard(section, prefix, page):
-    items = _get_section_items(section)
-    total = len(items)
-    if total == 0:
-        return None, 0, 0
-
-    max_page = (total - 1) // PAGE_SIZE
-    if page < 0:
-        page = 0
-    if page > max_page:
-        page = max_page
-
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    slice_items = items[start:end]
-
-    rows = []
-    for it in slice_items:
-        title = it.get("title") or it.get("filename") or it.get("id") or "Файл"
-        fid = it.get("id", "")
-        rows.append([InlineKeyboardButton(title, callback_data="FILE|%s|%s" % (prefix, fid))])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data="PAGE|%s|%s" % (prefix, page - 1)))
-    if page < max_page:
-        nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data="PAGE|%s|%s" % (prefix, page + 1)))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton("Проверить подписку", callback_data="CHECK_SUB")])
-
-    return InlineKeyboardMarkup(rows), page, max_page
-
-def show_list(update, section, prefix, page=0):
-    kb, page, max_page = _build_list_keyboard(section, prefix, page)
-    if not kb:
+    items = content.get(section_key, []) or []
+    if not items:
         update.message.reply_text(
             "Пока пусто.\n"
-            "Добавь файлы в:\n"
-            "• kb/handouts (Раздатка)\n"
-            "• kb/templates (Шаблоны)\n"
-            "и запусти: python3 kb/rebuild_content.py"
+            "Добавьте файлы в kb/{}/ и запустите kb/rebuild_content.py (пересоберёт kb/content.json).".format(
+                "handouts" if section_key == "handouts" else "templates"
+            )
         )
         return
 
-    header = "📎 Раздатка (стр. %s/%s)" % (page + 1, max_page + 1) if prefix == "H" else "🧾 Шаблоны (стр. %s/%s)" % (page + 1, max_page + 1)
-    update.message.reply_text(header, reply_markup=kb)
+    # inline buttons (max 60)
+    rows = []
+    for it in items[:60]:
+        title = it.get("title") or it.get("filename") or it.get("id") or "Файл"
+        cb = "{}:{}".format(prefix, it.get("id", ""))
+        rows.append([InlineKeyboardButton(title, callback_data=cb)])
+
+    update.message.reply_text("Выберите файл:", reply_markup=InlineKeyboardMarkup(rows))
+
 
 def send_courses(update, context):
     text = (
         "📚 Курсы:\n"
         "1) «Как вести бизнес, чтобы не заблокировали счета» — https://stepik.org/a/252040\n"
-        "2) Лид-магнит/бот — https://t.me/BorodulinAntiBlockBot\n\n"
+        "2) Лид‑магнит/бот — https://t.me/BorodulinAntiBlockBot\n\n"
         "Напишите: «Хочу курс» — подскажу, с чего начать."
     )
     update.message.reply_text(text, disable_web_page_preview=True)
 
-def send_file_by_id(context, chat_id, prefix, file_id):
-    section = "handouts" if prefix == "H" else "templates"
-    items = _get_section_items(section)
+
+def send_file_by_id(context, chat_id, prefix, file_id, message_to_edit=None):
+    content = load_content()
+    if prefix == "H":
+        items = content.get("handouts", []) or []
+    elif prefix == "T":
+        items = content.get("templates", []) or []
+    else:
+        if message_to_edit:
+            message_to_edit.edit_text("Неизвестный тип файла.")
+        return
 
     item = None
     for x in items:
@@ -309,21 +478,30 @@ def send_file_by_id(context, chat_id, prefix, file_id):
             break
 
     if not item:
-        context.bot.send_message(chat_id=chat_id, text="Файл не найден. Пересобери kb/content.json.")
+        if message_to_edit:
+            message_to_edit.edit_text("Файл не найден. Пересоберите kb/content.json.")
         return
 
     relpath = item.get("relpath", "")
     p = safe_resolve_relpath(relpath)
     if not p:
-        context.bot.send_message(chat_id=chat_id, text="Файл отсутствует на сервере: %s" % relpath)
+        if message_to_edit:
+            message_to_edit.edit_text("Файл отсутствует на сервере: {}".format(relpath))
         return
 
     title = item.get("title") or p.name
     try:
         with open(str(p), "rb") as f:
-            context.bot.send_document(chat_id=chat_id, document=f, filename=p.name, caption=title)
+            context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=p.name,
+                caption=title
+            )
     except Exception:
-        context.bot.send_message(chat_id=chat_id, text="Не смог отправить файл. Проверь права/размер/формат.")
+        if message_to_edit:
+            message_to_edit.edit_text("Не смог отправить файл. Проверьте права/размер/формат.")
+
 
 # -----------------------------
 # Handlers
@@ -331,31 +509,34 @@ def send_file_by_id(context, chat_id, prefix, file_id):
 def cmd_start(update, context):
     touch_heartbeat()
     keyboard = [
-        ["📎 Раздатка"],
-        ["🧾 Шаблон"],
-        ["📚 Курс"],
+        ["Раздатка"],
+        ["Шаблон"],
+        ["Курс"],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     update.message.reply_text(
         "Привет! Я AiAntiblokBot.\n\n"
-        "Помогаю по теме блокировок счетов/карт, 115-ФЗ и финансовой безопасности.\n"
+        "Я помогаю по теме блокировок счетов/карт, 115‑ФЗ и комплаенса.\n"
         "Выберите раздел ниже или опишите ситуацию текстом.",
         reply_markup=reply_markup
     )
+
 
 def cmd_help(update, context):
     update.message.reply_text(
         "/start — меню\n"
         "/status — диагностика\n\n"
         "Кнопки:\n"
-        "• 📎 Раздатка — материалы\n"
-        "• 🧾 Шаблон — документы\n"
-        "• 📚 Курс — ссылки"
+        "• Раздатка — материалы\n"
+        "• Шаблон — документы\n"
+        "• Курс — ссылки"
     )
+
 
 def cmd_status(update, context):
     touch_heartbeat()
+
     uid = update.effective_user.id if update.effective_user else None
     if ADMIN_IDS and uid not in ADMIN_IDS:
         update.message.reply_text("Недостаточно прав.")
@@ -367,26 +548,38 @@ def cmd_status(update, context):
 
     kb_files = 0
     try:
-        for sub in ("handouts", "templates"):
+        for sub in ("handouts", "templates", "text", "files"):
             d = KB_DIR / sub
             if d.exists():
                 kb_files += len([p for p in d.rglob("*") if p.is_file()])
     except Exception:
         pass
 
+    # check gigachat config
+    gc_ok = "yes" if GIGACHAT_AUTH_KEY else "no"
+    ca_ok = "yes" if (GIGACHAT_CA_BUNDLE and Path(GIGACHAT_CA_BUNDLE).exists()) else "no"
+    idx_ok = "yes" if TEXT_INDEX_JSON.exists() else "no"
+    content_ok = "yes" if CONTENT_JSON.exists() else "no"
+
     text = "\n".join([
         "🤖 AiAntiblokBot",
-        "🆔 PID: %s" % pid,
-        "⏱️ Uptime: %s" % fmt_uptime(uptime),
-        "❤️ Heartbeat age: %s" % (("%ss" % hb_age) if hb_age is not None else "n/a"),
-        "📚 KB files: %s" % kb_files,
-        "⚙️ Mode: %s" % ("PAID" if PAID_MODE else "FREE"),
-        "🐍 Python: %s" % platform.python_version(),
+        "🆔 PID: {}".format(pid),
+        "⏱️ Uptime: {}".format(fmt_uptime(uptime)),
+        "❤️ Heartbeat age: {}".format("%ss" % hb_age if hb_age is not None else "n/a"),
+        "📚 KB files: {}".format(kb_files),
+        "📦 content.json: {}".format(content_ok),
+        "📇 text_index.json: {}".format(idx_ok),
+        "⚙️ Mode: {}".format("PAID" if PAID_MODE else "FREE"),
+        "🧠 GigaChat configured: {}".format(gc_ok),
+        "🔒 CA bundle present: {}".format(ca_ok),
+        "🐍 Python: {}".format(platform.python_version()),
     ])
     update.message.reply_text(text)
 
+
 def on_callback(update, context):
     touch_heartbeat()
+
     q = update.callback_query
     if not q:
         return
@@ -403,6 +596,7 @@ def on_callback(update, context):
         if not uid:
             q.edit_message_text("Не вижу пользователя. Попробуйте снова.")
             return
+
         if is_subscriber(context.bot, uid):
             q.edit_message_text("✅ Подписка подтверждена. Можно пользоваться ботом.")
         else:
@@ -413,99 +607,73 @@ def on_callback(update, context):
             )
         return
 
-    # пагинация: PAGE|H|1  или PAGE|T|0
-    if data.startswith("PAGE|"):
-        parts = data.split("|")
-        if len(parts) == 3:
-            prefix = parts[1]
-            try:
-                page = int(parts[2])
-            except Exception:
-                page = 0
-
+    # file: H:<id> or T:<id>
+    if ":" in data:
+        prefix, file_id = data.split(":", 1)
+        if prefix in ("H", "T"):
             uid = update.effective_user.id if update.effective_user else None
             if uid and not is_subscriber(context.bot, uid):
                 q.edit_message_text("Доступ к материалам — только подписчикам:\nhttps://t.me/Borodulin_expert")
                 return
-
-            section = "handouts" if prefix == "H" else "templates"
-            kb, page, max_page = _build_list_keyboard(section, prefix, page)
-            header = "📎 Раздатка (стр. %s/%s)" % (page + 1, max_page + 1) if prefix == "H" else "🧾 Шаблоны (стр. %s/%s)" % (page + 1, max_page + 1)
-            if kb:
-                try:
-                    q.edit_message_text(header, reply_markup=kb)
-                except Exception:
-                    context.bot.send_message(chat_id=chat_id, text=header, reply_markup=kb)
+            send_file_by_id(context, chat_id, prefix, file_id, message_to_edit=q.message)
             return
 
-    # файл: FILE|H|<id> или FILE|T|<id>
-    if data.startswith("FILE|"):
-        parts = data.split("|")
-        if len(parts) == 3:
-            prefix = parts[1]
-            file_id = parts[2]
-
-            uid = update.effective_user.id if update.effective_user else None
-            if uid and not is_subscriber(context.bot, uid):
-                q.edit_message_text("Доступ к материалам — только подписчикам:\nhttps://t.me/Borodulin_expert")
-                return
-
-            send_file_by_id(context, chat_id, prefix, file_id)
-            return
 
 def handle_text(update, context):
     touch_heartbeat()
+
     if not update.message:
         return
 
     uid = update.effective_user.id if update.effective_user else None
     txt = (update.message.text or "").strip()
 
-    # лог входящих
     try:
         uname = update.effective_user.username or ""
         logging.info("msg from %s(%s): %s", uname, uid, txt)
     except Exception:
         pass
 
-    # 1) меню-кнопки — ОБЯЗАТЕЛЬНО ПЕРВЫМИ
+    # 1) menu buttons
     if txt in ("Раздатка", "📎 Раздатка"):
         if not gate_or_prompt(update, context):
             return
-        show_list(update, "handouts", "H", page=0)
+        show_list(update, "handouts", "H")
         return
 
     if txt in ("Шаблон", "🧾 Шаблон"):
         if not gate_or_prompt(update, context):
             return
-        show_list(update, "templates", "T", page=0)
+        show_list(update, "templates", "T")
         return
 
     if txt in ("Курс", "📚 Курс"):
         send_courses(update, context)
         return
 
-    # 2) быстрые фразы
+    # 2) quick phrases
     if txt.lower() in ("хочу курс", "курс хочу", "давай курс"):
         send_courses(update, context)
         return
 
-    # 3) мат/агрессия
+    # 3) abusive -> humor
     if is_abusive(txt):
         update.message.reply_text(random.choice(HUMOR_VARIANTS))
         return
 
-    # 4) смысловая маршрутизация
+    # 4) topic routing
     if is_on_topic(txt):
         answer_on_topic(update, context)
     else:
         answer_off_topic(update, context)
+
 
 def on_error(update, context):
     try:
         logging.exception("Unhandled error: %s", context.error)
     except Exception:
         pass
+
 
 # -----------------------------
 # main
@@ -515,7 +683,7 @@ def main():
     touch_heartbeat()
 
     if not BOT_TOKEN:
-        logging.error("BOT_TOKEN not set (env BOT_TOKEN or data/token.txt)")
+        logging.error("BOT_TOKEN is empty. Put it into .env as BOT_TOKEN=... and restart.")
         return
 
     updater = Updater(token=BOT_TOKEN, use_context=True)
@@ -530,11 +698,18 @@ def main():
     dp.add_handler(CallbackQueryHandler(on_callback))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
-    logging.info("KB content.json exists: %s", "yes" if CONTENT_JSON.exists() else "no")
-    logging.info("Bot starting polling... username check via getMe soon")
+    logging.info("content.json exists: %s", "yes" if CONTENT_JSON.exists() else "no")
+    logging.info("text_index.json exists: %s", "yes" if TEXT_INDEX_JSON.exists() else "no")
+    logging.info("GigaChat configured: %s scope=%s model=%s verify=%s ca=%s",
+                 "yes" if GIGACHAT_AUTH_KEY else "no",
+                 GIGACHAT_SCOPE, GIGACHAT_MODEL, str(GIGACHAT_VERIFY),
+                 GIGACHAT_CA_BUNDLE)
+
+    logging.info("Bot starting polling...")
 
     updater.start_polling()
     updater.idle()
+
 
 if __name__ == "__main__":
     main()

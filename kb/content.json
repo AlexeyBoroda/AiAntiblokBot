@@ -2,85 +2,89 @@
   "handouts": [
     {
       "id": "4419b7d90c38",
-      "title": "checklist 24h",
+      "title": "checklist_24h",
       "filename": "checklist_24h.pdf",
-      "ext": ".pdf",
-      "bytes": 181366,
-      "relpath": "kb/handouts/checklist_24h.pdf"
+      "relpath": "kb/handouts/checklist_24h.pdf",
+      "bytes": 181366
+    },
+    {
+      "id": "4f60d88d79b0",
+      "title": "readme_handouts",
+      "filename": "readme_handouts.md",
+      "relpath": "kb/handouts/readme_handouts.md",
+      "bytes": 559
     }
   ],
   "templates": [
     {
+      "id": "45541bed7308",
+      "title": "readme_templates",
+      "filename": "readme_templates.md",
+      "relpath": "kb/templates/readme_templates.md",
+      "bytes": 553
+    },
+    {
       "id": "c7f00ce4945f",
-      "title": "Шаблон № 1 Причины ограничения ДБО",
+      "title": "Шаблон_№_1_Причины_ограничения_ДБО",
       "filename": "Шаблон_№_1_Причины_ограничения_ДБО.DOCX",
-      "ext": ".docx",
-      "bytes": 18705,
-      "relpath": "kb/templates/Шаблон_№_1_Причины_ограничения_ДБО.DOCX"
+      "relpath": "kb/templates/Шаблон_№_1_Причины_ограничения_ДБО.DOCX",
+      "bytes": 18705
     },
     {
       "id": "8d604075879a",
-      "title": "Шаблон № 2 Причины блокирования карты",
+      "title": "Шаблон_№_2_Причины_блокирования_карты",
       "filename": "Шаблон_№_2_Причины_блокирования_карты.docx",
-      "ext": ".docx",
-      "bytes": 19209,
-      "relpath": "kb/templates/Шаблон_№_2_Причины_блокирования_карты.docx"
+      "relpath": "kb/templates/Шаблон_№_2_Причины_блокирования_карты.docx",
+      "bytes": 19209
     },
     {
       "id": "e3ffcc879511",
-      "title": "Шаблон № 3 Направление документов в целях устранения оснований договор",
+      "title": "Шаблон_№_3__Направление_документов_в_целях_устранения_оснований_договор",
       "filename": "Шаблон_№_3__Направление_документов_в_целях_устранения_оснований_договор.docx",
-      "ext": ".docx",
-      "bytes": 16199,
-      "relpath": "kb/templates/Шаблон_№_3__Направление_документов_в_целях_устранения_оснований_договор.docx"
+      "relpath": "kb/templates/Шаблон_№_3__Направление_документов_в_целях_устранения_оснований_договор.docx",
+      "bytes": 16199
     },
     {
       "id": "21be57431308",
-      "title": "Шаблон № 4 Направление документов в целях устранения оснований операция",
+      "title": "Шаблон_№_4__Направление_документов_в_целях_устранения_оснований_операция",
       "filename": "Шаблон_№_4__Направление_документов_в_целях_устранения_оснований_операция.docx",
-      "ext": ".docx",
-      "bytes": 16239,
-      "relpath": "kb/templates/Шаблон_№_4__Направление_документов_в_целях_устранения_оснований_операция.docx"
+      "relpath": "kb/templates/Шаблон_№_4__Направление_документов_в_целях_устранения_оснований_операция.docx",
+      "bytes": 16239
     },
     {
       "id": "74dbf1330130",
-      "title": "Шаблон № 5",
+      "title": "Шаблон_№_5",
       "filename": "Шаблон_№_5.docx",
-      "ext": ".docx",
-      "bytes": 23869,
-      "relpath": "kb/templates/Шаблон_№_5.docx"
+      "relpath": "kb/templates/Шаблон_№_5.docx",
+      "bytes": 23869
     },
     {
       "id": "07b99f6ec1bb",
-      "title": "Шаблон № 6",
+      "title": "Шаблон_№_6",
       "filename": "Шаблон_№_6.docx",
-      "ext": ".docx",
-      "bytes": 24382,
-      "relpath": "kb/templates/Шаблон_№_6.docx"
+      "relpath": "kb/templates/Шаблон_№_6.docx",
+      "bytes": 24382
     },
     {
       "id": "75a0d66102c4",
-      "title": "Шаблон № 7",
+      "title": "Шаблон_№_7",
       "filename": "Шаблон_№_7.docx",
-      "ext": ".docx",
-      "bytes": 24862,
-      "relpath": "kb/templates/Шаблон_№_7.docx"
+      "relpath": "kb/templates/Шаблон_№_7.docx",
+      "bytes": 24862
     },
     {
       "id": "185723383d06",
-      "title": "Шаблон № 8",
+      "title": "Шаблон_№_8",
       "filename": "Шаблон_№_8.docx",
-      "ext": ".docx",
-      "bytes": 23027,
-      "relpath": "kb/templates/Шаблон_№_8.docx"
+      "relpath": "kb/templates/Шаблон_№_8.docx",
+      "bytes": 23027
     },
     {
       "id": "416e274d2149",
-      "title": "Шаблон № 9",
+      "title": "Шаблон_№_9",
       "filename": "Шаблон_№_9.docx",
-      "ext": ".docx",
-      "bytes": 25523,
-      "relpath": "kb/templates/Шаблон_№_9.docx"
+      "relpath": "kb/templates/Шаблон_№_9.docx",
+      "bytes": 25523
     }
   ]
 }
