@@ -1,0 +1,2 @@
+<?php
+define('DASH_TOKEN', 'CHANGE_ME_STRONG_TOKEN');

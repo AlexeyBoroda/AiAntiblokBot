@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AiAntiblokBot — Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+    .kpi { min-width:240px; }
+    .muted { color:#666; font-size: 13px; }
+    .thread { margin-top: 12px; }
+    textarea { width:100%; min-height: 70px; }
+    button { padding:8px 12px; border-radius:8px; border:1px solid #333; background:#fff; cursor:pointer; }
+    button.primary { background:#002060; color:#fff; border-color:#002060; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f2f2f2; font-size:12px; margin-left:6px; }
+    .stars { font-size: 16px; letter-spacing: 2px; }
+    input { padding:7px 10px; border-radius:8px; border:1px solid #ccc; width: 320px; }
+  </style>
+</head>
+<body>
+  <h2>AiAntiblokBot — Dashboard</h2>
+  <p class="muted">Данные: <code>stats.json</code>, <code>comments.json</code>. Ответы админа: <code>reply.php</code> → <code>data/outbox.jsonl</code>.</p>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="row">
+      <div class="kpi"><div class="muted">Всего ответов с оценкой</div><div id="kpi_answers" style="font-size:28px">—</div></div>
+      <div class="kpi"><div class="muted">Всего оценок</div><div id="kpi_ratings" style="font-size:28px">—</div></div>
+      <div class="kpi"><div class="muted">Средняя оценка (1–5)</div><div id="kpi_avg" style="font-size:28px">—</div></div>
+      <div class="kpi"><div class="muted">Платные ⭐ (6-я)</div><div id="kpi_paid" style="font-size:28px">—</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="row" style="align-items:center">
+      <div>
+        <div class="muted">TOKEN для reply.php</div>
+        <input id="token" placeholder="TOKEN из dashboard/config.php">
+      </div>
+      <div><button class="primary" onclick="reloadAll()">Обновить</button></div>
+      <div class="muted">Подсказка: кнопка обновления подтягивает свежие JSON.</div>
+    </div>
+  </div>
+
+  <h3>Комментарии и треды</h3>
+  <div id="threads"></div>
+
+<script>
+async function fetchJson(path) {
+  const r = await fetch(path + "?t=" + Date.now(), {cache:"no-store"});
+  if (!r.ok) throw new Error("HTTP " + r.status + " for " + path);
+  return await r.json();
+}
+function escapeHtml(s){
+  return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+function starsStr(avg){
+  if (!avg || avg<=0) return "—";
+  const full = Math.round(avg);
+  return "⭐".repeat(full) + "<span class='muted'> ("+avg.toFixed(2)+")</span>";
+}
+async function sendReply(answerId, userId){
+  const token = document.getElementById("token").value.trim();
+  const ta = document.getElementById("reply_"+answerId);
+  const text = (ta && ta.value || "").trim();
+  if (!token) { alert("Введите TOKEN"); return; }
+  if (!text) { alert("Введите текст ответа"); return; }
+
+  const payload = new URLSearchParams();
+  payload.set("token", token);
+  payload.set("answer_id", answerId);
+  payload.set("user_id", userId);
+  payload.set("text", text);
+
+  const r = await fetch("reply.php", {method:"POST", body: payload});
+  const js = await r.json().catch(()=>({ok:false, error:"bad json"}));
+  if (!js.ok) { alert("Ошибка: " + (js.error||"unknown")); return; }
+  ta.value = "";
+  alert("Ок! Поставлено в очередь (cron отправит в течение минуты).");
+}
+function renderThreads(data){
+  const root = document.getElementById("threads");
+  root.innerHTML = "";
+  (data.threads||[]).forEach(th => {
+    const div = document.createElement("div");
+    div.className = "card thread";
+    const ratings = th.ratings||{};
+    const avg = ratings.avg_1_5 || 0;
+    const paid = ratings.paid_6 || 0;
+    div.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <div><b>Пользователь:</b> ${escapeHtml(th.user_name||"")} <span class="badge">${escapeHtml(String(th.user_id||""))}</span></div>
+          <div class="muted">answer_id: <code>${escapeHtml(th.answer_id||"")}</code></div>
+        </div>
+        <div class="stars">${starsStr(avg)} <span class="badge">оценок: ${escapeHtml(String(ratings.count||0))}</span> <span class="badge">платные ⭐: ${escapeHtml(String(paid))}</span></div>
+      </div>
+
+      <div style="margin-top:10px"><div class="muted">Вопрос</div><div>${escapeHtml(th.question||"")}</div></div>
+      <div style="margin-top:10px"><div class="muted">Ответ бота</div><div>${escapeHtml(th.answer||"")}</div></div>
+
+      <div style="margin-top:10px">
+        <div class="muted">Комментарии пользователя</div>
+        ${(th.comments||[]).map(c => `<div>— ${escapeHtml(c.text)} <span class="muted">(${escapeHtml(c.ts_str||"")})</span></div>`).join("") || "<div class='muted'>—</div>"}
+      </div>
+
+      <div style="margin-top:10px">
+        <div class="muted">Ответы админа</div>
+        ${(th.admin_replies||[]).map(a => `<div><b>Вы:</b> ${escapeHtml(a.text)} <span class="muted">(${escapeHtml(a.ts_str||"")})</span></div>`).join("") || "<div class='muted'>—</div>"}
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="muted">Ответить пользователю</div>
+        <textarea id="reply_${escapeHtml(th.answer_id||"")}"></textarea>
+        <div style="display:flex;gap:10px;margin-top:8px;align-items:center">
+          <button class="primary" onclick="sendReply('${escapeHtml(th.answer_id||"")}', '${escapeHtml(String(th.user_id||""))}')">Отправить</button>
+          <span class="muted">Доставка: cron <code>send_outbox.py</code></span>
+        </div>
+      </div>
+    `;
+    root.appendChild(div);
+  });
+}
+async function reloadAll(){
+  const stats = await fetchJson("stats.json");
+  document.getElementById("kpi_answers").textContent = stats.answers_with_rating || 0;
+  document.getElementById("kpi_ratings").textContent = stats.total_ratings || 0;
+  document.getElementById("kpi_avg").textContent = (stats.avg_rating_1_5 || 0).toFixed(2);
+  document.getElementById("kpi_paid").textContent = stats.paid_star_6 || 0;
+
+  const threads = await fetchJson("comments.json");
+  renderThreads(threads);
+}
+reloadAll();
+</script>
+</body>
+</html>

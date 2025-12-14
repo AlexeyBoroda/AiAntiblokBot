@@ -1,715 +1,677 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-AiAntiblokBot — тематический Telegram-бот (Python 3.6+, python-telegram-bot==12.8)
+AiAntiblokBot (python-telegram-bot==12.8, Python 3.6)
 
-MVP функции:
-1) Доступ к материалам только подписчикам канала https://t.me/Borodulin_expert
-2) Меню: Раздатка / Шаблон / Курс
-   - Раздатка: список файлов из kb/handouts (через kb/content.json)
-   - Шаблон: список файлов из kb/templates (через kb/content.json)
-   - Курс: список ссылок
-   - По нажатию на пункт списка — отправка файла
-3) Вопросы по теме блокировок/115-ФЗ:
-   - ищем релевантные фрагменты в базе знаний kb/text (индекс kb/text_index.json)
-   - формируем ответ через GigaChat API (с учётом контекста из базы)
-4) Вопросы не по теме: вежливый отбой (“консультирую только по блокировкам…”)
-5) Мат/агрессия: юморные ответы (рандом)
-6) /status — диагностика
+What this version fixes/improves:
+- ✅ Menu restored: "📎 Раздатка / 🧾 Шаблон / 📚 Курс" loads from data/content.json (or kb/content.json) with safe fallbacks.
+- ✅ RAG+GigaChat: retrieves relevant KB snippets (without showing filenames) and asks GigaChat to form a clean answer.
+- ✅ Clean output: strips markdown symbols (#,*,`), makes readable short blocks + emojis.
+- ✅ Anti-loop: prevents repeating the same question forever; advances the dialogue step or asks a different уточнение.
+- ✅ Feedback: after every AI answer shows ⭐1..⭐5 + ⭐6 (платная) + 💬 Комментарий; logs to data/feedback.jsonl.
+- ✅ Comments: user can leave a comment; saved to feedback log (threaded by answer_id).
 
-Важно:
-- Токены/ключи храним только в .env (в корне проекта рядом с bot.py)
-- Для SSL к GigaChat обычно нужен CA bundle. По умолчанию: data/ca/ca_bundle.pem
+Deploy: put this file as bot.py and restart watchdog.
 """
+
+from __future__ import print_function
 
 import os
 import re
 import json
 import time
+import uuid
 import math
-import random
 import logging
-import platform
-from pathlib import Path
+from datetime import datetime
 
+import requests
 from dotenv import load_dotenv
 
 from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    Filters,
+    Updater, CommandHandler, MessageHandler, Filters,
+    CallbackQueryHandler, CallbackContext
 )
 
-from gigachat_client import GigaChatClient
-
-
 # -----------------------------
-# Paths / env
+# Config / Paths
 # -----------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
-KB_DIR = BASE_DIR / "kb"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+KB_DIR = os.path.join(BASE_DIR, "kb")
+KB_TEXT_DIR = os.path.join(KB_DIR, "text")
 
-# Load .env first!
-load_dotenv(str(BASE_DIR / ".env"))
+CONTENT_JSON_CANDIDATES = [
+    os.path.join(DATA_DIR, "content.json"),
+    os.path.join(KB_DIR, "content.json"),
+]
 
-CONTENT_JSON = KB_DIR / "content.json"
-TEXT_INDEX_JSON = KB_DIR / "text_index.json"
-HEARTBEAT_FILE = DATA_DIR / "heartbeat.txt"
+KB_INDEX_PATH = os.path.join(DATA_DIR, "kb_index.json")
+FEEDBACK_LOG = os.path.join(DATA_DIR, "feedback.jsonl")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@Borodulin_expert").strip()  # @channelusername
-
-# if you want feature flags later
-PAID_MODE = os.getenv("PAID_MODE", "0").strip().lower() in ("1", "true", "yes")
-
-# /status can be limited to admins (comma-separated user ids)
-ADMIN_IDS = set()
-_admin_raw = os.getenv("ADMIN_IDS", "").strip()
-if _admin_raw:
-    try:
-        ADMIN_IDS = set(int(x.strip()) for x in _admin_raw.split(",") if x.strip())
-    except Exception:
-        ADMIN_IDS = set()
-
-# GigaChat config
-GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "").strip()  # WITHOUT "Basic "
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
-GIGACHAT_CA_BUNDLE = os.getenv("GIGACHAT_CA_BUNDLE", str(DATA_DIR / "ca" / "ca_bundle.pem")).strip()
-GIGACHAT_VERIFY = os.getenv("GIGACHAT_VERIFY", "1").strip() not in ("0", "false", "False", "no", "NO")
-
-START_TS = int(time.time())
-
-# membership cache
-_SUB_CACHE = {}  # user_id -> (ts, bool)
-SUB_CACHE_TTL = 60  # sec
-
-# text index cache
-_TEXT_INDEX = None
-_TEXT_INDEX_MTIME = 0
-
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # -----------------------------
 # Logging
 # -----------------------------
-def init_logging():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / "bot.log"
+logger = logging.getLogger("AiAntiblokBot")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s AiAntiblokBot: %(message)s")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s AiAntiblokBot: %(message)s",
-        handlers=[
-            logging.FileHandler(str(log_path), encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    logging.info("Logging initialized. pid=%s base=%s", os.getpid(), str(BASE_DIR))
+_fh = logging.FileHandler(os.path.join(LOG_DIR, "bot.log"), encoding="utf-8")
+_fh.setFormatter(_fmt)
+logger.addHandler(_fh)
 
+_sh = logging.StreamHandler()
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
 
-def touch_heartbeat():
+# -----------------------------
+# Helpers
+# -----------------------------
+def now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def safe_write_jsonl(path, event):
+    line = json.dumps(event, ensure_ascii=False)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def normalize_text(s):
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def is_greeting(text):
+    t = normalize_text(text)
+    return t in ("привет", "здравствуй", "здравствуйте", "добрый день", "добрый вечер", "доброе утро", "хай", "hello")
+
+def make_main_keyboard():
+    kb = [["📎 Раздатка", "🧾 Шаблон", "📚 Курс"]]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def clean_kb_markdown(text):
+    """Make KB snippets readable in Telegram (no raw markdown artifacts)."""
+    if not text:
+        return ""
+    # remove fenced code
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    # drop headings markers
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+    # bullet markers -> "• "
+    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.M)
+    # bold/italic markers
+    text = text.replace("**", "").replace("*", "").replace("__", "").replace("_", "")
+    # excessive spaces
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+def prettify_answer(text):
+    """Format assistant output: short blocks + emojis, no markdown."""
+    text = clean_kb_markdown(text)
+    # keep it compact
+    text = text.strip()
+
+    # If long paragraph -> split a bit
+    if len(text) > 900:
+        # try split by sentences
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        out, buf = [], ""
+        for p in parts:
+            if len(buf) + len(p) + 1 < 420:
+                buf = (buf + " " + p).strip()
+            else:
+                if buf:
+                    out.append(buf)
+                buf = p
+        if buf:
+            out.append(buf)
+        text = "\n\n".join(out[:6]).strip()
+
+    return text
+
+def build_feedback_keyboard(answer_id):
+    # ⭐6 as monetization option
+    row1 = [
+        InlineKeyboardButton("⭐1", callback_data="FB:STAR:1:%s" % answer_id),
+        InlineKeyboardButton("⭐2", callback_data="FB:STAR:2:%s" % answer_id),
+        InlineKeyboardButton("⭐3", callback_data="FB:STAR:3:%s" % answer_id),
+        InlineKeyboardButton("⭐4", callback_data="FB:STAR:4:%s" % answer_id),
+        InlineKeyboardButton("⭐5", callback_data="FB:STAR:5:%s" % answer_id),
+    ]
+    row2 = [
+        InlineKeyboardButton("⭐6 PRO", callback_data="FB:STAR:6:%s" % answer_id),
+        InlineKeyboardButton("💬 Комментарий", callback_data="FB:COMMENT:%s" % answer_id),
+    ]
+    return InlineKeyboardMarkup([row1, row2])
+
+# -----------------------------
+# Content menu (content.json)
+# -----------------------------
+def _load_json(path):
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        HEARTBEAT_FILE.write_text(str(int(time.time())), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def heartbeat_age():
-    try:
-        ts = int(HEARTBEAT_FILE.read_text(encoding="utf-8").strip())
-        return int(time.time()) - ts
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return None
 
-
-def fmt_uptime(seconds):
-    if seconds < 60:
-        return "%ss" % seconds
-    m = seconds // 60
-    s = seconds % 60
-    if m < 60:
-        return "%sm %ss" % (m, s)
-    h = m // 60
-    m2 = m % 60
-    return "%sh %sm" % (h, m2)
-
-
-# -----------------------------
-# Content loading
-# -----------------------------
 def load_content():
     """
-    content.json:
-    {
-      "handouts": [{"id":"...", "title":"...", "relpath":"kb/handouts/file.pdf", ...}],
-      "templates": [{"id":"...", "title":"...", "relpath":"kb/templates/file.docx", ...}]
-    }
+    Tries multiple locations. Supports several structures:
+    - {"handouts":[{"title":"..","url":".."}], "templates":[...], "courses":[...]}
+    - {"Раздатка":[...], "Шаблоны":[...], "Курсы":[...]}
     """
-    try:
-        raw = CONTENT_JSON.read_text(encoding="utf-8")
-        obj = json.loads(raw)
-        if not isinstance(obj, dict):
-            return {"handouts": [], "templates": []}
-        obj.setdefault("handouts", [])
-        obj.setdefault("templates", [])
-        return obj
-    except Exception:
-        return {"handouts": [], "templates": []}
+    data = None
+    for p in CONTENT_JSON_CANDIDATES:
+        if os.path.exists(p):
+            data = _load_json(p)
+            if data:
+                logger.info("Loaded content.json: %s", p)
+                break
+    if not isinstance(data, dict):
+        data = {}
 
+    # normalize keys
+    out = {"handouts": [], "templates": [], "courses": []}
+    # common variants
+    for k in data.keys():
+        lk = k.lower()
+        if "раздат" in lk or "handout" in lk or "materials" in lk:
+            out["handouts"] = data[k] or []
+        elif "шаблон" in lk or "template" in lk:
+            out["templates"] = data[k] or []
+        elif "курс" in lk or "course" in lk:
+            out["courses"] = data[k] or []
 
-def safe_resolve_relpath(relpath):
-    """
-    Разрешаем отдавать файлы только из kb/.
-    relpath хранится относительно BASE_DIR, например: "kb/handouts/x.pdf"
-    """
-    try:
-        p = (BASE_DIR / relpath).resolve()
-        kb_root = KB_DIR.resolve()
-        if str(p).startswith(str(kb_root)) and p.exists() and p.is_file():
-            return p
-    except Exception:
-        pass
-    return None
+    # already normalized?
+    if "handouts" in data and not out["handouts"]:
+        out["handouts"] = data.get("handouts") or []
+    if "templates" in data and not out["templates"]:
+        out["templates"] = data.get("templates") or []
+    if "courses" in data and not out["courses"]:
+        out["courses"] = data.get("courses") or []
 
+    # hard fallbacks (so no weird placeholders)
+    if not out["courses"]:
+        out["courses"] = [
+            {"title": "Базовый курс (Stepik)", "url": "https://stepik.org/a/252040"},
+            {"title": "Free (бесплатно)", "url": "https://stepik.org/a/252809"},
+            {"title": "PRO", "url": "https://stepik.org/a/252823"},
+        ]
 
-# -----------------------------
-# Subscription gate
-# -----------------------------
-def is_subscriber(bot, user_id):
-    now = int(time.time())
-    cached = _SUB_CACHE.get(user_id)
-    if cached and (now - cached[0] <= SUB_CACHE_TTL):
-        return cached[1]
-
-    ok = False
-    try:
-        member = bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        status = getattr(member, "status", "") or ""
-        ok = status in ("creator", "administrator", "member")
-    except Exception:
-        ok = False
-
-    _SUB_CACHE[user_id] = (now, ok)
-    return ok
-
-
-def gate_or_prompt(update, context):
-    """
-    True => доступ разрешён
-    False => отправлено сообщение “подпишитесь”
-    """
-    uid = update.effective_user.id if update.effective_user else None
-    if not uid:
-        return False
-
-    if is_subscriber(context.bot, uid):
-        return True
-
-    text = (
-        "Доступ к материалам — только для подписчиков канала:\n"
-        "✅ https://t.me/Borodulin_expert\n\n"
-        "Подпишитесь и нажмите «Проверить подписку»."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Подписаться", url="https://t.me/Borodulin_expert")],
-        [InlineKeyboardButton("Проверить подписку", callback_data="CHECK_SUB")],
-    ])
-    update.message.reply_text(text, reply_markup=kb)
-    return False
-
-
-# -----------------------------
-# Humor / moderation
-# -----------------------------
-HUMOR_VARIANTS = [
-    "Мама говорила: ИИ — это не тот, кого так назвали, а тот, кто ведёт себя как ИИ.",
-    "Мама говорила: неважно, ИИ ты или ChatGPT — важно, что ты отвечаешь с умом.",
-    "Мама говорила: если спрашивают, кто ты — значит, уже неплохо работаешь.",
-    "Мама говорила: ярлыки — для коробок. Я — для ответов.",
-    "Мама говорила: ИИ — это как коробка конфет. Никогда не знаешь, что спросишь следующим.",
-]
-_BAD_WORDS = ["сука", "бляд", "хуй", "хуе", "пизд", "еба", "ёба", "нахуй", "мудак", "говно", "идиот"]
-
-
-def is_abusive(text):
-    t = (text or "").lower()
-    return any(w in t for w in _BAD_WORDS)
-
-
-# -----------------------------
-# Topic routing
-# -----------------------------
-TOPIC_KEYWORDS = [
-    "блок", "замороз", "115", "комплаенс", "росфин", "росфинмониторинг",
-    "счет", "счёт", "карта", "перевод", "платеж", "платёж",
-    "дбо", "банк", "огранич", "разблок", "попал в базу", "мошенническ",
-]
-
-
-def is_on_topic(text):
-    t = (text or "").lower()
-    return any(k in t for k in TOPIC_KEYWORDS)
-
-
-def answer_off_topic(update, context):
-    update.message.reply_text(
-        "Я ИИ‑помощник и консультирую только по вопросам блокировок счетов/карт, 115‑ФЗ и комплаенса.\n"
-        "Переформулируйте вопрос так, чтобы была связь с блокировкой."
-    )
-
-
-# -----------------------------
-# KB text index (retrieval)
-# -----------------------------
-_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
-
-
-def _tokenize(s):
-    return [w.lower() for w in _WORD_RE.findall(s or "") if len(w) >= 2]
-
-
-def load_text_index():
-    global _TEXT_INDEX, _TEXT_INDEX_MTIME
-    if not TEXT_INDEX_JSON.exists():
-        _TEXT_INDEX = None
-        _TEXT_INDEX_MTIME = 0
-        return None
-
-    mtime = int(TEXT_INDEX_JSON.stat().st_mtime)
-    if _TEXT_INDEX and _TEXT_INDEX_MTIME == mtime:
-        return _TEXT_INDEX
-
-    try:
-        obj = json.loads(TEXT_INDEX_JSON.read_text(encoding="utf-8"))
-        if isinstance(obj, dict) and "chunks" in obj and "postings" in obj:
-            _TEXT_INDEX = obj
-            _TEXT_INDEX_MTIME = mtime
-            return obj
-    except Exception:
-        pass
-
-    _TEXT_INDEX = None
-    _TEXT_INDEX_MTIME = mtime
-    return None
-
-
-def search_kb(query, top_k=3):
-    """
-    Simple TF-IDF scoring over chunk postings from kb/rebuild_text_index.py output.
-    Returns list of chunks (dict) with fields: text, source, idx, ...
-    """
-    idx = load_text_index()
-    if not idx:
-        return []
-
-    q_terms = _tokenize(query)
-    if not q_terms:
-        return []
-
-    postings = idx.get("postings", {}) or {}
-    df = idx.get("df", {}) or {}
-    N = int(idx.get("N", 0) or 0)
-    chunks = idx.get("chunks", []) or []
-
-    scores = {}
-    for term in q_terms:
-        plist = postings.get(term)
-        if not plist:
-            continue
-        dfi = int(df.get(term, 0) or 0)
-        # idf with smoothing
-        idf = math.log((N + 1.0) / (dfi + 1.0)) + 1.0
-        for item in plist:
-            # item: [chunk_idx, tf]
-            try:
-                cidx = int(item[0])
-                tf = float(item[1])
-            except Exception:
-                continue
-            scores[cidx] = scores.get(cidx, 0.0) + tf * idf
-
-    if not scores:
-        return []
-
-    best = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    out = []
-    for cidx, sc in best:
-        if 0 <= cidx < len(chunks):
-            ch = chunks[cidx]
-            ch2 = dict(ch)
-            ch2["_score"] = sc
-            out.append(ch2)
     return out
 
-
-# -----------------------------
-# GigaChat answering
-# -----------------------------
-def build_system_prompt():
-    return (
-        "Ты — консультант по блокировкам банковских счетов/карт, 115‑ФЗ, комплаенсу и финансовой безопасности бизнеса.\n"
-        "Отвечай по‑деловому, кратко, по шагам.\n"
-        "Если пользователь спрашивает не по теме блокировок/комплаенса — вежливо откажи и попроси переформулировать.\n"
-        "Не выдумывай факты. Если данных недостаточно — задай 2–3 уточняющих вопроса.\n"
-    )
-
-
-def build_user_prompt(user_text, kb_chunks):
-    ctx = ""
-    if kb_chunks:
-        parts = []
-        for ch in kb_chunks:
-            src = ch.get("source", "kb")
-            txt = (ch.get("text") or "").strip()
-            if not txt:
-                continue
-            # safety: limit context length
-            if len(txt) > 1200:
-                txt = txt[:1200] + "…"
-            parts.append("Источник: {}\n{}".format(src, txt))
-        if parts:
-            ctx = "Ниже выдержки из базы знаний. Используй их как основу ответа.\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
-
-    return ctx + "Вопрос пользователя:\n" + user_text
-
-
-def answer_on_topic(update, context):
-    user_text = (update.message.text or "").strip()
-
-    kb_chunks = search_kb(user_text, top_k=3)
-
-    # If we have no KB at all, we can still answer via GigaChat, but keep it safe.
-    if not GIGACHAT_AUTH_KEY:
-        # fallback: no gigachat configured
-        update.message.reply_text(
-            "Сейчас ИИ‑модуль не настроен.\n"
-            "Но я могу подсказать базовый план: что именно заблокировали (счёт/карта), какая операция, кто контрагент и что ответил банк?"
-        )
-        return
-
-    try:
-        client = GigaChatClient(
-            auth_key=GIGACHAT_AUTH_KEY,
-            scope=GIGACHAT_SCOPE,
-            model=GIGACHAT_MODEL,
-            ca_bundle_path=GIGACHAT_CA_BUNDLE,
-            verify=GIGACHAT_VERIFY,
-            timeout=30,
-        )
-        resp = client.chat(
-            system_prompt=build_system_prompt(),
-            user_prompt=build_user_prompt(user_text, kb_chunks),
-            temperature=0.2,
-            max_tokens=900,
-        )
-        update.message.reply_text(resp)
-    except Exception as e:
-        logging.exception("GigaChat error: %s", e)
-        update.message.reply_text("Сейчас не могу обратиться к ИИ‑модулю. Попробуйте ещё раз позже.")
-
-
-# -----------------------------
-# UI: lists / files / courses
-# -----------------------------
-def show_list(update, section_key, prefix):
-    """
-    section_key: "handouts" | "templates"
-    prefix: "H" | "T"
-    """
-    content = load_content()
-    items = content.get(section_key, []) or []
+def _format_items(items, max_n=10):
     if not items:
+        return "Пока нет материалов в списке."
+    lines = []
+    for i, it in enumerate(items[:max_n], 1):
+        if isinstance(it, str):
+            lines.append("%d) %s" % (i, it))
+            continue
+        if isinstance(it, dict):
+            title = (it.get("title") or it.get("name") or "Материал").strip()
+            url = (it.get("url") or it.get("link") or "").strip()
+            if url:
+                lines.append("%d) %s — %s" % (i, title, url))
+            else:
+                lines.append("%d) %s" % (i, title))
+    return "\n".join(lines).strip()
+
+# -----------------------------
+# KB indexing (simple lexical search)
+# -----------------------------
+WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
+
+def tokenize(text):
+    text = (text or "").lower()
+    return [w for w in WORD_RE.findall(text) if len(w) >= 2]
+
+def load_kb_documents():
+    docs = []
+    # kb/text/*.md
+    if os.path.isdir(KB_TEXT_DIR):
+        for fn in os.listdir(KB_TEXT_DIR):
+            if fn.lower().endswith(".md"):
+                path = os.path.join(KB_TEXT_DIR, fn)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        txt = f.read()
+                    docs.append({"id": "text/%s" % fn, "text": txt})
+                except Exception:
+                    continue
+
+    # kb/*.md (optional)
+    if os.path.isdir(KB_DIR):
+        for fn in os.listdir(KB_DIR):
+            if fn.lower().endswith(".md"):
+                path = os.path.join(KB_DIR, fn)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        txt = f.read()
+                    docs.append({"id": fn, "text": txt})
+                except Exception:
+                    continue
+
+    return docs
+
+def rebuild_kb_index():
+    docs = load_kb_documents()
+    if not docs:
+        logger.info("KB docs not found (kb/text). Index not rebuilt.")
+        return {"docs": [], "df": {}, "doc_len": {}}
+
+    df = {}
+    doc_len = {}
+    index_docs = []
+
+    for d in docs:
+        tokens = tokenize(d["text"])
+        doc_len[d["id"]] = len(tokens)
+        seen = set(tokens)
+        for t in seen:
+            df[t] = df.get(t, 0) + 1
+        index_docs.append({"id": d["id"], "text": d["text"]})
+
+    idx = {"docs": index_docs, "df": df, "doc_len": doc_len, "n_docs": len(index_docs)}
+    with open(KB_INDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False)
+    logger.info("KB index rebuilt: %d docs", len(index_docs))
+    return idx
+
+def load_kb_index():
+    if os.path.exists(KB_INDEX_PATH):
+        try:
+            with open(KB_INDEX_PATH, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            if isinstance(idx, dict) and "docs" in idx:
+                return idx
+        except Exception:
+            pass
+    return rebuild_kb_index()
+
+def bm25_score(query_tokens, doc_tokens, df, n_docs, k1=1.2, b=0.75, avgdl=200.0):
+    # simplified BM25
+    score = 0.0
+    freqs = {}
+    for t in doc_tokens:
+        freqs[t] = freqs.get(t, 0) + 1
+    dl = float(len(doc_tokens)) or 1.0
+    for t in query_tokens:
+        if t not in freqs:
+            continue
+        n_qi = df.get(t, 0)
+        # IDF with +1 smoothing
+        idf = math.log(1.0 + (n_docs - n_qi + 0.5) / (n_qi + 0.5))
+        tf = freqs[t]
+        denom = tf + k1 * (1 - b + b * (dl / (avgdl or 1.0)))
+        score += idf * ((tf * (k1 + 1)) / (denom or 1.0))
+    return score
+
+def retrieve_kb_snippets(query, idx, top_k=3, max_chars=1400):
+    docs = idx.get("docs") or []
+    if not docs:
+        return []
+
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return []
+
+    df = idx.get("df") or {}
+    n_docs = idx.get("n_docs") or max(1, len(docs))
+    avgdl = 0.0
+    if idx.get("doc_len"):
+        avgdl = sum(idx["doc_len"].values()) / float(max(1, len(idx["doc_len"])))
+    else:
+        avgdl = 200.0
+
+    scored = []
+    for d in docs:
+        dt = d.get("text", "")
+        doc_tokens = tokenize(dt)
+        s = bm25_score(q_tokens, doc_tokens, df, n_docs, avgdl=avgdl)
+        if s > 0:
+            scored.append((s, dt))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    snippets = []
+    for s, text in scored[:top_k]:
+        # take first informative chunk
+        t = clean_kb_markdown(text)
+        # cut to limit
+        t = t[:max_chars].strip()
+        if t:
+            snippets.append(t)
+    return snippets
+
+# -----------------------------
+# GigaChat API (access token refresh every 30 min)
+# -----------------------------
+GIGACHAT_TOKEN_CACHE = {"token": None, "exp_ts": 0}
+
+def gigachat_get_access_token(auth_key, scope, ca_bundle_path=None, timeout=30):
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": "Basic " + auth_key,
+    }
+    verify = True
+    if ca_bundle_path and os.path.exists(ca_bundle_path):
+        verify = ca_bundle_path
+    r = requests.post(url, headers=headers, data={"scope": scope}, timeout=timeout, verify=verify)
+    r.raise_for_status()
+    data = r.json()
+    token = data.get("access_token") or ""
+    # token TTL ~30 min; keep 25 min to be safe
+    exp = int(time.time()) + 25 * 60
+    return token, exp
+
+def gigachat_call(prompt, model="GigaChat", timeout=60):
+    auth_key = os.getenv("GIGACHAT_AUTH_KEY", "").strip()
+    scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
+    ca_bundle = os.getenv("GIGACHAT_CA_BUNDLE", "").strip()  # e.g. data/ca/ca_bundle.pem
+
+    if not auth_key:
+        return None, "GIGACHAT_AUTH_KEY not set"
+
+    # refresh token if needed
+    if (not GIGACHAT_TOKEN_CACHE["token"]) or (time.time() >= GIGACHAT_TOKEN_CACHE["exp_ts"]):
+        try:
+            token, exp = gigachat_get_access_token(auth_key, scope, ca_bundle_path=ca_bundle or None)
+            GIGACHAT_TOKEN_CACHE["token"] = token
+            GIGACHAT_TOKEN_CACHE["exp_ts"] = exp
+        except Exception as e:
+            return None, "GigaChat auth error: %s" % str(e)
+
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": "Bearer " + GIGACHAT_TOKEN_CACHE["token"],
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Ты — AI-помощник по блокировкам счетов/карт, 115-ФЗ, ЗСК и комплаенсу. Отвечай кратко, структурировано, без markdown (#,*). Используй эмодзи ✅ 1️⃣ 2️⃣ 3️⃣ для читаемости. Не упоминай файлы/источники."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        # OpenAI-like
+        choices = data.get("choices") or []
+        if not choices:
+            return None, "No choices"
+        msg = choices[0].get("message") or {}
+        return msg.get("content") or "", None
+    except Exception as e:
+        return None, "GigaChat request error: %s" % str(e)
+
+def build_llm_prompt(user_text, snippets):
+    ctx = "\n\n".join(snippets) if snippets else ""
+    if ctx:
+        return (
+            "Вопрос пользователя: %s\n\n"
+            "Фрагменты базы знаний (для опоры):\n%s\n\n"
+            "Сформируй ответ. Если вопрос не по теме блокировок/115-ФЗ/ЗСК/комплаенса — мягко верни к теме и предложи 1 пример переформулировки. "
+            "Если вопрос — термин/сокращение (например МФК/МВК/РКН/ФНС) и это связано с финансовой безопасностью/платежами/банками — дай определение."
+        ) % (user_text, ctx)
+    return (
+        "Вопрос пользователя: %s\n\n"
+        "Сформируй ответ. Если вопрос не по теме блокировок/115-ФЗ/ЗСК/комплаенса — мягко верни к теме и предложи 1 пример переформулировки."
+    ) % user_text
+
+# -----------------------------
+# Dialogue state (anti-loop + case mode)
+# -----------------------------
+def get_user_state(context):
+    return context.user_data.setdefault("state", {
+        "case_step": 0,
+        "last_bot_q": "",
+        "repeat_count": 0,
+        "awaiting_comment_for": None,
+        "last_answer_id": None,
+    })
+
+def update_repeat_guard(state, bot_question):
+    bot_question_n = normalize_text(bot_question)
+    if bot_question_n and bot_question_n == normalize_text(state.get("last_bot_q", "")):
+        state["repeat_count"] = int(state.get("repeat_count", 0)) + 1
+    else:
+        state["repeat_count"] = 0
+        state["last_bot_q"] = bot_question
+    return state["repeat_count"]
+
+# -----------------------------
+# Core handlers
+# -----------------------------
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Доброго времени суток! 👋\n\n"
+        "Я помогу по блокировкам счетов/карт, 115‑ФЗ, ЗСК и комплаенсу.\n"
+        "Опишите ситуацию одной фразой (что именно заблокировали и кто: банк/ФНС/приставы/ЦБ).",
+        reply_markup=make_main_keyboard()
+    )
+
+def status(update: Update, context: CallbackContext):
+    update.message.reply_text("✅ Бот работает. Напишите вопрос или нажмите кнопку меню.", reply_markup=make_main_keyboard())
+
+def handle_menu(update: Update, context: CallbackContext):
+    text = (update.message.text or "").strip()
+    content = context.bot_data.get("content") or load_content()
+    context.bot_data["content"] = content
+
+    if "раздат" in text.lower() or "раздач" in text.lower():
+        msg = "📎 Раздатка:\n" + _format_items(content.get("handouts") or [])
+        update.message.reply_text(msg, reply_markup=make_main_keyboard())
+        return True
+    if "шаблон" in text.lower():
+        msg = "🧾 Шаблоны:\n" + _format_items(content.get("templates") or [])
+        update.message.reply_text(msg, reply_markup=make_main_keyboard())
+        return True
+    if "курс" in text.lower():
+        msg = "📚 Курсы:\n" + _format_items(content.get("courses") or [])
+        update.message.reply_text(msg, reply_markup=make_main_keyboard())
+        return True
+    return False
+
+def handle_text(update: Update, context: CallbackContext):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    logger.info("msg from %s(%s): %s", user.username or user.first_name, user.id, text)
+
+    # awaiting comment?
+    state = get_user_state(context)
+    if state.get("awaiting_comment_for"):
+        ans_id = state["awaiting_comment_for"]
+        state["awaiting_comment_for"] = None
+        event = {
+            "ts": now_iso(),
+            "type": "comment",
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "answer_id": ans_id,
+            "text": text,
+        }
+        safe_write_jsonl(FEEDBACK_LOG, event)
+        update.message.reply_text("Спасибо! Комментарий записал ✅", reply_markup=make_main_keyboard())
+        return
+
+    # menu buttons
+    if handle_menu(update, context):
+        return
+
+    # greeting
+    if is_greeting(text):
         update.message.reply_text(
-            "Пока пусто.\n"
-            "Добавьте файлы в kb/{}/ и запустите kb/rebuild_content.py (пересоберёт kb/content.json).".format(
-                "handouts" if section_key == "handouts" else "templates"
-            )
+            "Доброго времени суток! 👋\n\n"
+            "Скажите коротко: что заблокировали (счёт/карту/ДБО) и что написал банк/причина (если есть).",
+            reply_markup=make_main_keyboard()
         )
         return
 
-    # inline buttons (max 60)
-    rows = []
-    for it in items[:60]:
-        title = it.get("title") or it.get("filename") or it.get("id") or "Файл"
-        cb = "{}:{}".format(prefix, it.get("id", ""))
-        rows.append([InlineKeyboardButton(title, callback_data=cb)])
+    # Build RAG context
+    kb_idx = context.bot_data.get("kb_index")
+    if not kb_idx:
+        kb_idx = load_kb_index()
+        context.bot_data["kb_index"] = kb_idx
 
-    update.message.reply_text("Выберите файл:", reply_markup=InlineKeyboardMarkup(rows))
+    snippets = retrieve_kb_snippets(text, kb_idx, top_k=3)
 
+    prompt = build_llm_prompt(text, snippets)
+    answer, err = gigachat_call(prompt)
 
-def send_courses(update, context):
-    text = (
-        "📚 Курсы:\n"
-        "1) «Как вести бизнес, чтобы не заблокировали счета» — https://stepik.org/a/252040\n"
-        "2) Лид‑магнит/бот — https://t.me/BorodulinAntiBlockBot\n\n"
-        "Напишите: «Хочу курс» — подскажу, с чего начать."
-    )
-    update.message.reply_text(text, disable_web_page_preview=True)
-
-
-def send_file_by_id(context, chat_id, prefix, file_id, message_to_edit=None):
-    content = load_content()
-    if prefix == "H":
-        items = content.get("handouts", []) or []
-    elif prefix == "T":
-        items = content.get("templates", []) or []
-    else:
-        if message_to_edit:
-            message_to_edit.edit_text("Неизвестный тип файла.")
-        return
-
-    item = None
-    for x in items:
-        if str(x.get("id", "")) == str(file_id):
-            item = x
-            break
-
-    if not item:
-        if message_to_edit:
-            message_to_edit.edit_text("Файл не найден. Пересоберите kb/content.json.")
-        return
-
-    relpath = item.get("relpath", "")
-    p = safe_resolve_relpath(relpath)
-    if not p:
-        if message_to_edit:
-            message_to_edit.edit_text("Файл отсутствует на сервере: {}".format(relpath))
-        return
-
-    title = item.get("title") or p.name
-    try:
-        with open(str(p), "rb") as f:
-            context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=p.name,
-                caption=title
+    # fallback without LLM if needed
+    if err or not answer:
+        # If KB has snippets, answer with first snippet compactly
+        if snippets:
+            answer = snippets[0]
+        else:
+            answer = (
+                "Я консультирую по блокировкам счетов/карт, 115‑ФЗ, ЗСК и комплаенсу.\n"
+                "Опишите кейс: что заблокировали, когда, и что написал банк."
             )
-    except Exception:
-        if message_to_edit:
-            message_to_edit.edit_text("Не смог отправить файл. Проверьте права/размер/формат.")
 
+    answer = prettify_answer(answer)
 
-# -----------------------------
-# Handlers
-# -----------------------------
-def cmd_start(update, context):
-    touch_heartbeat()
-    keyboard = [
-        ["Раздатка"],
-        ["Шаблон"],
-        ["Курс"],
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    # anti-loop: if bot repeats itself too much, force a different clarifying question
+    rep = update_repeat_guard(state, answer)
+    if rep >= 2:
+        answer = (
+            "Похоже, я повторяюсь 🙃 Давайте иначе.\n\n"
+            "✅ 1) Что именно ограничено: счёт/карта/ДБО?\n"
+            "✅ 2) Формулировка банка (2–3 слова) или «без объяснений»?\n"
+            "✅ 3) Вы — ИП/ООО или физлицо?"
+        )
+        state["repeat_count"] = 0
+        state["last_bot_q"] = answer
 
-    update.message.reply_text(
-        "Привет! Я AiAntiblokBot.\n\n"
-        "Я помогаю по теме блокировок счетов/карт, 115‑ФЗ и комплаенса.\n"
-        "Выберите раздел ниже или опишите ситуацию текстом.",
-        reply_markup=reply_markup
-    )
+    # send answer + feedback keyboard
+    answer_id = str(uuid.uuid4())
+    state["last_answer_id"] = answer_id
 
+    update.message.reply_text(answer, reply_markup=make_main_keyboard())
 
-def cmd_help(update, context):
-    update.message.reply_text(
-        "/start — меню\n"
-        "/status — диагностика\n\n"
-        "Кнопки:\n"
-        "• Раздатка — материалы\n"
-        "• Шаблон — документы\n"
-        "• Курс — ссылки"
-    )
-
-
-def cmd_status(update, context):
-    touch_heartbeat()
-
-    uid = update.effective_user.id if update.effective_user else None
-    if ADMIN_IDS and uid not in ADMIN_IDS:
-        update.message.reply_text("Недостаточно прав.")
-        return
-
-    pid = os.getpid()
-    uptime = int(time.time()) - START_TS
-    hb_age = heartbeat_age()
-
-    kb_files = 0
     try:
-        for sub in ("handouts", "templates", "text", "files"):
-            d = KB_DIR / sub
-            if d.exists():
-                kb_files += len([p for p in d.rglob("*") if p.is_file()])
+        context.bot.send_message(
+            chat_id=chat_id,
+            text="Оцените ответ:",
+            reply_markup=build_feedback_keyboard(answer_id)
+        )
     except Exception:
         pass
 
-    # check gigachat config
-    gc_ok = "yes" if GIGACHAT_AUTH_KEY else "no"
-    ca_ok = "yes" if (GIGACHAT_CA_BUNDLE and Path(GIGACHAT_CA_BUNDLE).exists()) else "no"
-    idx_ok = "yes" if TEXT_INDEX_JSON.exists() else "no"
-    content_ok = "yes" if CONTENT_JSON.exists() else "no"
-
-    text = "\n".join([
-        "🤖 AiAntiblokBot",
-        "🆔 PID: {}".format(pid),
-        "⏱️ Uptime: {}".format(fmt_uptime(uptime)),
-        "❤️ Heartbeat age: {}".format("%ss" % hb_age if hb_age is not None else "n/a"),
-        "📚 KB files: {}".format(kb_files),
-        "📦 content.json: {}".format(content_ok),
-        "📇 text_index.json: {}".format(idx_ok),
-        "⚙️ Mode: {}".format("PAID" if PAID_MODE else "FREE"),
-        "🧠 GigaChat configured: {}".format(gc_ok),
-        "🔒 CA bundle present: {}".format(ca_ok),
-        "🐍 Python: {}".format(platform.python_version()),
-    ])
-    update.message.reply_text(text)
-
-
-def on_callback(update, context):
-    touch_heartbeat()
-
+def on_callback(update: Update, context: CallbackContext):
     q = update.callback_query
     if not q:
         return
-    try:
-        q.answer()
-    except Exception:
-        pass
+    q.answer()
+    data = q.data or ""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
 
-    data = (q.data or "").strip()
-    chat_id = q.message.chat_id
+    if data.startswith("FB:STAR:"):
+        # FB:STAR:5:<answer_id>
+        parts = data.split(":")
+        stars = int(parts[2])
+        ans_id = parts[3] if len(parts) >= 4 else None
 
-    if data == "CHECK_SUB":
-        uid = update.effective_user.id if update.effective_user else None
-        if not uid:
-            q.edit_message_text("Не вижу пользователя. Попробуйте снова.")
-            return
+        safe_write_jsonl(FEEDBACK_LOG, {
+            "ts": now_iso(),
+            "type": "rating",
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "answer_id": ans_id,
+            "stars": stars,
+        })
 
-        if is_subscriber(context.bot, uid):
-            q.edit_message_text("✅ Подписка подтверждена. Можно пользоваться ботом.")
-        else:
+        if stars >= 6:
             q.edit_message_text(
-                "Подписка не найдена.\n"
-                "Подпишитесь: https://t.me/Borodulin_expert\n"
-                "И нажмите «Проверить подписку» ещё раз."
+                "Спасибо за ⭐6! 🙌\n\n"
+                "⭐6 — это «PRO‑оценка». Можно монетизировать это как донат/поддержку.\n"
+                "Добавьте вашу ссылку на оплату/донат в тексте здесь (я оставил место)."
             )
+        else:
+            q.edit_message_text("Спасибо за оценку: %d⭐ ✅" % stars)
         return
 
-    # file: H:<id> or T:<id>
-    if ":" in data:
-        prefix, file_id = data.split(":", 1)
-        if prefix in ("H", "T"):
-            uid = update.effective_user.id if update.effective_user else None
-            if uid and not is_subscriber(context.bot, uid):
-                q.edit_message_text("Доступ к материалам — только подписчикам:\nhttps://t.me/Borodulin_expert")
-                return
-            send_file_by_id(context, chat_id, prefix, file_id, message_to_edit=q.message)
-            return
+    if data.startswith("FB:COMMENT:"):
+        parts = data.split(":")
+        ans_id = parts[2] if len(parts) >= 3 else None
 
+        state = get_user_state(context)
+        state["awaiting_comment_for"] = ans_id
 
-def handle_text(update, context):
-    touch_heartbeat()
+        safe_write_jsonl(FEEDBACK_LOG, {
+            "ts": now_iso(),
+            "type": "comment_request",
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "answer_id": ans_id,
+        })
 
-    if not update.message:
+        q.edit_message_text("Напишите комментарий одним сообщением (что улучшить/что было непонятно).")
         return
-
-    uid = update.effective_user.id if update.effective_user else None
-    txt = (update.message.text or "").strip()
-
-    try:
-        uname = update.effective_user.username or ""
-        logging.info("msg from %s(%s): %s", uname, uid, txt)
-    except Exception:
-        pass
-
-    # 1) menu buttons
-    if txt in ("Раздатка", "📎 Раздатка"):
-        if not gate_or_prompt(update, context):
-            return
-        show_list(update, "handouts", "H")
-        return
-
-    if txt in ("Шаблон", "🧾 Шаблон"):
-        if not gate_or_prompt(update, context):
-            return
-        show_list(update, "templates", "T")
-        return
-
-    if txt in ("Курс", "📚 Курс"):
-        send_courses(update, context)
-        return
-
-    # 2) quick phrases
-    if txt.lower() in ("хочу курс", "курс хочу", "давай курс"):
-        send_courses(update, context)
-        return
-
-    # 3) abusive -> humor
-    if is_abusive(txt):
-        update.message.reply_text(random.choice(HUMOR_VARIANTS))
-        return
-
-    # 4) topic routing
-    if is_on_topic(txt):
-        answer_on_topic(update, context)
-    else:
-        answer_off_topic(update, context)
-
-
-def on_error(update, context):
-    try:
-        logging.exception("Unhandled error: %s", context.error)
-    except Exception:
-        pass
-
 
 # -----------------------------
-# main
+# Error handler
+# -----------------------------
+def on_error(update: object, context: CallbackContext):
+    logger.exception("Unhandled error: %s", context.error)
+
+# -----------------------------
+# Main
 # -----------------------------
 def main():
-    init_logging()
-    touch_heartbeat()
-
-    if not BOT_TOKEN:
-        logging.error("BOT_TOKEN is empty. Put it into .env as BOT_TOKEN=... and restart.")
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    if not bot_token:
+        logger.error("BOT_TOKEN is empty. Export BOT_TOKEN and restart.")
         return
 
-    updater = Updater(token=BOT_TOKEN, use_context=True)
+    # preload content & kb
+    try:
+        content = load_content()
+        logger.info("content.json loaded: handouts=%d templates=%d courses=%d",
+                    len(content.get("handouts") or []),
+                    len(content.get("templates") or []),
+                    len(content.get("courses") or []))
+    except Exception as e:
+        logger.info("content.json load failed: %s", e)
+
+    try:
+        load_kb_index()
+    except Exception as e:
+        logger.info("KB index init failed: %s", e)
+
+    updater = Updater(token=bot_token, use_context=True)
     dp = updater.dispatcher
 
-    dp.add_error_handler(on_error)
-
-    dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("help", cmd_help))
-    dp.add_handler(CommandHandler("status", cmd_status))
-
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("status", status))
     dp.add_handler(CallbackQueryHandler(on_callback))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
-    logging.info("content.json exists: %s", "yes" if CONTENT_JSON.exists() else "no")
-    logging.info("text_index.json exists: %s", "yes" if TEXT_INDEX_JSON.exists() else "no")
-    logging.info("GigaChat configured: %s scope=%s model=%s verify=%s ca=%s",
-                 "yes" if GIGACHAT_AUTH_KEY else "no",
-                 GIGACHAT_SCOPE, GIGACHAT_MODEL, str(GIGACHAT_VERIFY),
-                 GIGACHAT_CA_BUNDLE)
+    dp.add_error_handler(on_error)
 
-    logging.info("Bot starting polling...")
-
-    updater.start_polling()
+    logger.info("Bot starting polling...")
+    updater.start_polling(clean=True)
     updater.idle()
-
 
 if __name__ == "__main__":
     main()
