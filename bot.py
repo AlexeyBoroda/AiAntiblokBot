@@ -264,6 +264,68 @@ def load_content():
     
     return out
 
+
+def safe_resolve_relpath(relpath):
+    """Безопасно резолвит путь внутри kb/ и проверяет наличие файла."""
+    try:
+        p = os.path.abspath(os.path.join(KB_DIR, os.pardir, relpath))
+        kb_root = os.path.abspath(KB_DIR)
+        if os.path.commonpath([p, kb_root]) == kb_root and os.path.isfile(p):
+            return p
+    except Exception:
+        return None
+    return None
+
+
+def build_file_keyboard(items, prefix):
+    """Инлайн-кнопки для выбора материалов (раздатка/шаблоны)."""
+    rows = []
+    for it in items[:50]:
+        title = (it.get("title") or it.get("filename") or it.get("name") or "Материал").strip()
+        rows.append([InlineKeyboardButton(title, callback_data="FILE:%s:%s" % (prefix, it.get("id", "")))])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def send_material_by_id(context: CallbackContext, chat_id, prefix: str, item_id: str, message_to_edit=None):
+    """Отправляет файл по ID из content.json."""
+    content = context.bot_data.get("content") or load_content()
+    context.bot_data["content"] = content
+
+    if prefix == "H":
+        items = content.get("handouts") or []
+    elif prefix == "T":
+        items = content.get("templates") or []
+    else:
+        if message_to_edit:
+            message_to_edit.edit_text("Неизвестный тип материала.")
+        return
+
+    item = None
+    for x in items:
+        if str(x.get("id", "")) == str(item_id):
+            item = x
+            break
+
+    if not item:
+        if message_to_edit:
+            message_to_edit.edit_text("Материал не найден. Обновите content.json.")
+        return
+
+    path = safe_resolve_relpath(item.get("relpath", ""))
+    title = (item.get("title") or item.get("filename") or "Материал").strip()
+
+    if not path:
+        if message_to_edit:
+            message_to_edit.edit_text("Файл отсутствует на сервере.")
+        return
+
+    try:
+        with open(path, "rb") as f:
+            context.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(path), caption=title)
+    except Exception:
+        if message_to_edit:
+            message_to_edit.edit_text("Не удалось отправить файл. Проверьте доступ.")
+
 def _format_items(items, max_n=10):
     """Форматирует список элементов меню."""
     if not items:
@@ -519,6 +581,79 @@ def detect_branch(text):
         return "no_reason"
     return None
 
+
+def is_on_topic(text):
+    """Грубая проверка, что сообщение похоже на кейс по блокировкам."""
+    t = normalize_text(text)
+    keywords = [
+        "блокир", "замороз", "заблок", "115", "зск", "фз",
+        "комплаенс", "сомнительн", "дбо", "платеж", "карта", "счёт",
+        "счет", "банк", "пристав", "фнс", "налог", "фссп",
+    ]
+    return any(k in t for k in keywords)
+
+
+def ensure_case_flow(update: Update, context: CallbackContext, user_state, text):
+    """Сценарный опрос: задаёт обязательные вопросы перед LLM."""
+    if not is_on_topic(text) and not user_state.get("branch"):
+        return False
+
+    case = user_state.get("case_data") or {"step": 1, "asked_questions": [], "answers": {}}
+    asked = set(case.get("asked_questions") or [])
+    answers = case.get("answers") or {}
+
+    def ask_once(key, question):
+        if key in asked:
+            return False
+        asked.add(key)
+        case["asked_questions"] = list(asked)
+        update_user_state_persistent(update.effective_user.id, {"case_data": case})
+        update.message.reply_text(question, reply_markup=make_main_keyboard())
+        return True
+
+    norm = normalize_text(text)
+
+    # Шаг 1: когда и что заблокировали
+    if case.get("step", 1) <= 1:
+        has_date = bool(re.search(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", norm)) or any(
+            w in norm for w in ["вчера", "сегодня", "давно", "неделю", "месяц"]
+        )
+        has_obj = any(w in norm for w in ["счёт", "счет", "карта", "дбо", "дбк"])
+        if has_date and has_obj:
+            answers["when_what"] = text
+            case["step"] = 2
+        elif ask_once("when_what", "Когда заблокировали (дата/вчера/сегодня) и что именно: счёт/карта/ДБО?"):
+            return True
+        else:
+            case["step"] = 2
+
+    # Шаг 2: причина банка
+    if case.get("step", 2) == 2:
+        has_reason = any(w in norm for w in ["115", "подозр", "риск", "зск", "красн", "блокиров", "огранич"])
+        if has_reason:
+            answers["bank_reason"] = text
+            case["step"] = 3
+        elif ask_once("bank_reason", "Что банк указал как причину? 1–2 фразы из уведомления."):
+            return True
+        else:
+            case["step"] = 3
+
+    # Шаг 3: детали операции/контрагента
+    if case.get("step", 3) == 3:
+        has_operation = any(w in norm for w in ["операц", "перевод", "контраг", "поступлен", "платёж", "платеж", "сумма"])
+        if has_operation:
+            answers["operation"] = text
+            case["step"] = 4
+        elif ask_once("operation", "Какая операция или контрагент вызвали вопрос банка? Укажите сумму и описание."):
+            return True
+        else:
+            case["step"] = 4
+
+    case["answers"] = answers
+    user_state["case_data"] = case
+    update_user_state_persistent(update.effective_user.id, {"case_data": case})
+    return False
+
 # -----------------------------
 # Anti-loop: отслеживание заданных вопросов
 # -----------------------------
@@ -567,13 +702,15 @@ def handle_menu(update: Update, context: CallbackContext):
     
     if "раздат" in text.lower() or "раздач" in text.lower():
         items = content.get("handouts") or []
-        msg = "📎 Раздатка:\n\n" + _format_items(items)
-        update.message.reply_text(msg, reply_markup=make_main_keyboard())
+        kb = build_file_keyboard(items, "H")
+        msg = "📎 Раздатка: выберите файл" if kb else "📎 Раздатка:\n\n" + _format_items(items)
+        update.message.reply_text(msg, reply_markup=kb or make_main_keyboard())
         return True
     if "шаблон" in text.lower():
         items = content.get("templates") or []
-        msg = "🧾 Шаблоны:\n\n" + _format_items(items)
-        update.message.reply_text(msg, reply_markup=make_main_keyboard())
+        kb = build_file_keyboard(items, "T")
+        msg = "🧾 Шаблоны: выберите файл" if kb else "🧾 Шаблоны:\n\n" + _format_items(items)
+        update.message.reply_text(msg, reply_markup=kb or make_main_keyboard())
         return True
     if "курс" in text.lower():
         items = content.get("courses") or []
@@ -666,6 +803,10 @@ def handle_text(update: Update, context: CallbackContext):
     if branch and branch != user_state.get("branch"):
         update_user_state_persistent(user.id, {"branch": branch})
         user_state["branch"] = branch
+
+    # Сценарный опрос кейса
+    if ensure_case_flow(update, context, user_state, text):
+        return
     
     # RAG: получаем фрагменты из KB
     kb_idx = context.bot_data.get("kb_index")
@@ -760,7 +901,13 @@ def on_callback(update: Update, context: CallbackContext):
     data = q.data or ""
     user = update.effective_user
     chat_id = update.effective_chat.id
-    
+
+    if data.startswith("FILE:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            send_material_by_id(context, chat_id, parts[1], parts[2], message_to_edit=q.message)
+        return
+
     if data.startswith("FB:STAR:"):
         # FB:STAR:5:<answer_id>
         parts = data.split(":")
