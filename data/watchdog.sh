@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="/home/c/ck60067/borodulin.expert/public_html/my_script/AiAntiblokBot"
+# Определяем BASE автоматически (папка на уровень выше data/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$BASE"
 
 mkdir -p "$BASE/data" "$BASE/logs"

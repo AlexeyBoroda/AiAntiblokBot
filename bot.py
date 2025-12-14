@@ -428,7 +428,11 @@ def gigachat_get_access_token(auth_key, scope, ca_bundle_path=None, timeout=30):
     exp = int(time.time()) + 25 * 60  # 25 минут для безопасности
     return token, exp
 
-def gigachat_call(prompt, model="GigaChat", timeout=60):
+def gigachat_call(prompt, model=None, timeout=60):
+    # Модель из .env или по умолчанию
+    if model is None:
+        model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
+    
     auth_key = os.getenv("GIGACHAT_AUTH_KEY", "").strip()
     scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
     ca_bundle = os.getenv("GIGACHAT_VERIFY_CA", "").strip() or os.getenv("GIGACHAT_CA_BUNDLE", "").strip()
